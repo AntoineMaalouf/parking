@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:data.melbourne.vic.gov.au)",
+      "Bash(python -m venv .venv)",
+      "Bash(.venv/Scripts/pip install:*)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" \"https://data.melbourne.vic.gov.au/api/explore/v2.1/catalog/datasets/on-street-parking-bay-sensors/records?limit=1&select=kerbsideid,status_description,status_timestamp,location\")"
+    ]
+  }
+}

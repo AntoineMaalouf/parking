@@ -1,0 +1,793 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Melbourne Parking Map</title>
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #1a1a2e;
+      color: #eee;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 18px;
+      background: #16213e;
+      border-bottom: 1px solid #0f3460;
+      flex-shrink: 0;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    header h1 {
+      font-size: 1.1rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+
+    #stats {
+      display: flex;
+      gap: 16px;
+      font-size: 0.85rem;
+    }
+
+    .stat { display: flex; align-items: center; gap: 6px; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+    .dot-free     { background: #22c55e; }
+    .dot-occupied { background: #ef4444; }
+    .dot-unknown  { background: #94a3b8; }
+
+    #status-bar {
+      font-size: 0.78rem;
+      color: #94a3b8;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    #refresh-btn {
+      padding: 4px 12px;
+      border: 1px solid #0f3460;
+      border-radius: 4px;
+      background: #0f3460;
+      color: #eee;
+      cursor: pointer;
+      font-size: 0.78rem;
+    }
+    #refresh-btn:hover { background: #1a4a8a; }
+
+    #map { flex: 1; }
+
+    #loading-overlay {
+      position: absolute;
+      inset: 0;
+      background: rgba(26, 26, 46, 0.85);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      z-index: 9999;
+      gap: 14px;
+      font-size: 1rem;
+    }
+
+    .spinner {
+      width: 42px; height: 42px;
+      border: 4px solid #0f3460;
+      border-top-color: #22c55e;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    #error-banner {
+      display: none;
+      position: absolute;
+      top: 60px; left: 50%; transform: translateX(-50%);
+      background: #7f1d1d;
+      color: #fca5a5;
+      padding: 8px 18px;
+      border-radius: 6px;
+      z-index: 9998;
+      font-size: 0.85rem;
+    }
+
+    /* Street search panel */
+    #street-panel {
+      position: absolute;
+      top: 70px;
+      right: 14px;
+      z-index: 1000;
+      background: #16213e;
+      border: 1px solid #0f3460;
+      border-radius: 8px;
+      padding: 12px 14px;
+      width: 270px;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+    }
+
+    #street-panel label {
+      display: block;
+      font-size: 0.78rem;
+      color: #94a3b8;
+      margin-bottom: 6px;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    #street-search-wrap {
+      position: relative;
+    }
+
+    #street-input {
+      width: 100%;
+      padding: 6px 28px 6px 8px;
+      background: #0f1b33;
+      border: 1px solid #0f3460;
+      border-radius: 4px;
+      color: #eee;
+      font-size: 0.85rem;
+      outline: none;
+    }
+    #street-input:focus { border-color: #3b82f6; }
+
+    #street-clear {
+      display: none;
+      position: absolute;
+      right: 6px; top: 50%;
+      transform: translateY(-50%);
+      background: none;
+      border: none;
+      color: #94a3b8;
+      cursor: pointer;
+      font-size: 1rem;
+      line-height: 1;
+      padding: 0;
+    }
+    #street-clear:hover { color: #eee; }
+
+    #street-suggestions {
+      margin-top: 4px;
+      max-height: 160px;
+      overflow-y: auto;
+      border-radius: 4px;
+    }
+
+    .suggestion {
+      padding: 5px 8px;
+      font-size: 0.82rem;
+      cursor: pointer;
+      border-radius: 3px;
+      color: #cbd5e1;
+    }
+    .suggestion:hover, .suggestion.active { background: #0f3460; color: #fff; }
+
+    #street-result {
+      margin-top: 10px;
+      font-size: 0.82rem;
+      display: none;
+    }
+    #street-result .result-name {
+      font-weight: 600;
+      color: #e2e8f0;
+      margin-bottom: 4px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #street-result .result-counts {
+      display: flex;
+      gap: 10px;
+    }
+    #street-result .rc { display: flex; align-items: center; gap: 5px; }
+    #street-result .rc-num { font-size: 1.1rem; font-weight: 700; }
+    #street-result .rc-free  { color: #22c55e; }
+    #street-result .rc-occ   { color: #ef4444; }
+
+    /* Popup notify button */
+    .popup-wrap { font-size: 0.82rem; line-height: 1.6; min-width: 160px; }
+    .popup-wrap b { font-size: 0.88rem; }
+    .notify-btn {
+      margin-top: 7px;
+      width: 100%;
+      padding: 5px 0;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 0.8rem;
+      font-weight: 600;
+      transition: background 0.15s;
+    }
+    .notify-btn.watch   { background: #f59e0b; color: #1a1a2e; }
+    .notify-btn.watch:hover   { background: #fbbf24; }
+    .notify-btn.unwatch { background: #374151; color: #d1d5db; }
+    .notify-btn.unwatch:hover { background: #4b5563; }
+    .notify-btn:disabled { opacity: 0.5; cursor: default; }
+
+    /* Watch badge (clickable) */
+    #watch-badge {
+      font-size: 0.78rem;
+      color: #f59e0b;
+      background: none;
+      border: 1px solid #f59e0b44;
+      border-radius: 4px;
+      padding: 2px 8px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    #watch-badge:hover { background: #f59e0b22; }
+
+    /* Watch list panel */
+    #watch-panel {
+      display: none;
+      position: absolute;
+      top: 46px;
+      right: 14px;
+      z-index: 2000;
+      background: #16213e;
+      border: 1px solid #f59e0b55;
+      border-radius: 8px;
+      padding: 12px 14px;
+      width: 280px;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.6);
+    }
+    #watch-panel.open { display: block; }
+    #watch-panel-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    #watch-panel-header span {
+      font-size: 0.78rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: #f59e0b;
+    }
+    #watch-panel-header .close-btn {
+      background: none;
+      border: none;
+      color: #94a3b8;
+      cursor: pointer;
+      font-size: 1rem;
+      line-height: 1;
+      padding: 0;
+    }
+    #watch-panel-header .close-btn:hover { color: #eee; }
+    #watch-panel-limit {
+      font-size: 0.72rem;
+      color: #64748b;
+      margin-bottom: 8px;
+      text-align: right;
+    }
+    #watch-list { display: flex; flex-direction: column; gap: 6px; }
+    .watch-item {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 6px 8px;
+      background: #0f1b33;
+      border-radius: 5px;
+      font-size: 0.8rem;
+    }
+    .watch-item-info { flex: 1; min-width: 0; line-height: 1.4; }
+    .watch-item-id { color: #94a3b8; font-size: 0.72rem; }
+    .watch-item-street {
+      color: #e2e8f0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .watch-remove {
+      background: none;
+      border: none;
+      color: #64748b;
+      cursor: pointer;
+      font-size: 1rem;
+      line-height: 1;
+      padding: 2px 0 0 4px;
+      flex-shrink: 0;
+    }
+    .watch-remove:hover { color: #ef4444; }
+    #watch-clear-all {
+      margin-top: 10px;
+      width: 100%;
+      padding: 6px 0;
+      background: none;
+      border: 1px solid #374151;
+      border-radius: 4px;
+      color: #94a3b8;
+      font-size: 0.78rem;
+      cursor: pointer;
+    }
+    #watch-clear-all:hover { border-color: #ef4444; color: #ef4444; }
+    #watch-empty {
+      font-size: 0.82rem;
+      color: #64748b;
+      text-align: center;
+      padding: 8px 0;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Melbourne On-Street Parking</h1>
+  <div id="stats">
+    <div class="stat"><div class="dot dot-free"></div><span id="count-free">—</span> free</div>
+    <div class="stat"><div class="dot dot-occupied"></div><span id="count-occupied">—</span> occupied</div>
+    <div class="stat"><div class="dot dot-unknown"></div><span id="count-total">—</span> total</div>
+  </div>
+  <div id="status-bar">
+    <span id="last-updated">Loading…</span>
+    <button id="refresh-btn" onclick="loadData(true)">Refresh</button>
+  </div>
+</header>
+
+<div id="map"></div>
+<div id="loading-overlay"><div class="spinner"></div><span>Loading parking data…</span></div>
+<div id="error-banner"></div>
+
+<!-- Watched bays panel -->
+<div id="watch-panel">
+  <div id="watch-panel-header">
+    <span>Watched bays</span>
+    <button class="close-btn" onclick="closeWatchPanel()">×</button>
+  </div>
+  <div id="watch-panel-limit"></div>
+  <div id="watch-list"><div id="watch-empty">No bays being watched.</div></div>
+  <button id="watch-clear-all" style="display:none" onclick="clearAllWatched()">Clear all</button>
+</div>
+
+<!-- Street search panel -->
+<div id="street-panel">
+  <label>Filter by street</label>
+  <div id="street-search-wrap">
+    <input id="street-input" type="text" placeholder="e.g. King Street" autocomplete="off" />
+    <button id="street-clear" title="Clear">×</button>
+  </div>
+  <div id="street-suggestions"></div>
+  <div id="street-result">
+    <div class="result-name" id="result-name"></div>
+    <div class="result-counts">
+      <div class="rc rc-free"><span class="rc-num" id="result-free">0</span> free</div>
+      <div class="rc rc-occ"><span class="rc-num" id="result-occ">0</span> occupied</div>
+    </div>
+  </div>
+</div>
+
+<script>
+  // ── Map setup ────────────────────────────────────────────────────────────
+  // Default centre: Villiers Street, North Melbourne
+  const DEFAULT_CENTER = [-37.8013, 144.9523];
+  const DEFAULT_ZOOM   = 16;
+
+  const map = L.map("map", {
+    center: DEFAULT_CENTER,
+    zoom: DEFAULT_ZOOM,
+    preferCanvas: true,       // faster rendering for thousands of markers
+  });
+
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+    maxZoom: 19,
+  }).addTo(map);
+
+  // ── State ────────────────────────────────────────────────────────────────
+  let markers = [];           // array of L.circleMarker
+  let refreshTimer = null;
+  let pushoverEnabled = false;
+  const MAX_WATCHED = 10;
+  const watchedBays = new Map();  // bay_id → {id, street, road_description}
+
+  const FREE_COLOR     = "#22c55e";
+  const OCCUPIED_COLOR = "#ef4444";
+  const UNKNOWN_COLOR  = "#94a3b8";
+
+  function bayColor(bay) {
+    if (bay.status === "Present")    return OCCUPIED_COLOR;
+    if (bay.status === "Unoccupied") return FREE_COLOR;
+    return UNKNOWN_COLOR;
+  }
+
+  // ── Notify / watch helpers ───────────────────────────────────────────────
+  async function removeWatch(bayId) {
+    await fetch(`/api/watch/${bayId}`, { method: "DELETE" });
+    watchedBays.delete(bayId);
+    const marker = markers.find(m => m._bayId === bayId);
+    if (marker && marker._bayData && marker.isPopupOpen()) {
+      marker.setPopupContent(buildPopupContent(marker._bayData));
+      wirePopupButton(marker, marker._bayData);
+    }
+    updateWatchBadge();
+    renderWatchPanel();
+  }
+
+  async function toggleWatch(bay) {
+    if (watchedBays.has(bay.id)) {
+      await removeWatch(bay.id);
+      return;
+    }
+    if (watchedBays.size >= MAX_WATCHED) {
+      alert(`Watch limit reached (${MAX_WATCHED} bays maximum).`);
+      return;
+    }
+    const res = await fetch("/api/watch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ bay_id: bay.id, street: bay.street, road_description: bay.road_description }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      alert(err.detail || "Could not enable notifications.");
+      return;
+    }
+    watchedBays.set(bay.id, { id: bay.id, street: bay.street, road_description: bay.road_description });
+    const marker = markers.find(m => m._bayId === bay.id);
+    if (marker && marker.isPopupOpen()) {
+      marker.setPopupContent(buildPopupContent(bay));
+      wirePopupButton(marker, bay);
+    }
+    updateWatchBadge();
+    renderWatchPanel();
+  }
+
+  function buildPopupContent(bay) {
+    const updated = bay.updated_at
+      ? new Date(bay.updated_at).toLocaleTimeString("en-AU", { hour: "2-digit", minute: "2-digit" })
+      : "unknown";
+    const watching = watchedBays.has(bay.id);
+    const atLimit  = watchedBays.size >= MAX_WATCHED && !watching;
+    let notifyHtml = "";
+    if (pushoverEnabled && bay.occupied) {
+      notifyHtml = atLimit
+        ? `<div style="margin-top:7px;font-size:0.75rem;color:#94a3b8;">Watch limit reached (${MAX_WATCHED}/10)</div>`
+        : `<button class="notify-btn ${watching ? "unwatch" : "watch"}" id="notify-btn-${bay.id}">
+             ${watching ? "Cancel notification" : "Notify me when free"}
+           </button>`;
+    }
+    const segment = bay.road_description
+      ? `<div style="margin:3px 0 4px;color:#94a3b8;font-size:0.76rem;">${bay.road_description}</div>`
+      : "";
+    return `<div class="popup-wrap">
+      <b>Bay ${bay.id}</b>
+      ${segment}
+      Status: <b>${bay.status}</b><br>
+      Last updated: ${updated}
+      ${notifyHtml}
+    </div>`;
+  }
+
+  function wirePopupButton(marker, bay) {
+    marker.off("popupopen");
+    marker.on("popupopen", () => {
+      const btn = document.getElementById(`notify-btn-${bay.id}`);
+      if (!btn) return;
+      btn.addEventListener("click", async () => { btn.disabled = true; await toggleWatch(bay); });
+    });
+  }
+
+  // ── Watch panel ──────────────────────────────────────────────────────────
+  function renderWatchPanel() {
+    const list  = document.getElementById("watch-list");
+    const limit = document.getElementById("watch-panel-limit");
+    limit.textContent = `${watchedBays.size} / ${MAX_WATCHED} bays`;
+    const clearBtn = document.getElementById("watch-clear-all");
+    if (watchedBays.size === 0) {
+      list.innerHTML = `<div id="watch-empty">No bays being watched.</div>`;
+      clearBtn.style.display = "none";
+      return;
+    }
+    clearBtn.style.display = "block";
+    list.innerHTML = "";
+    watchedBays.forEach((info, bayId) => {
+      const item = document.createElement("div");
+      item.className = "watch-item";
+      item.innerHTML = `
+        <div class="watch-item-info">
+          <div class="watch-item-street">${info.road_description || info.street || "Unknown location"}</div>
+          <div class="watch-item-id">Bay ${bayId}</div>
+        </div>
+        <button class="watch-remove" title="Remove">×</button>`;
+      item.querySelector(".watch-remove").addEventListener("click", () => removeWatch(bayId));
+      list.appendChild(item);
+    });
+  }
+
+  async function clearAllWatched() {
+    await Promise.all([...watchedBays.keys()].map(id => fetch(`/api/watch/${id}`, { method: "DELETE" })));
+    watchedBays.clear();
+    // Reset any open popups on watched markers
+    markers.forEach(m => {
+      if (m._bayData && m._bayOccupied && m.isPopupOpen()) {
+        m.setPopupContent(buildPopupContent(m._bayData));
+        wirePopupButton(m, m._bayData);
+      }
+    });
+    updateWatchBadge();
+    renderWatchPanel();
+  }
+
+  function openWatchPanel()  { renderWatchPanel(); document.getElementById("watch-panel").classList.add("open"); }
+  function closeWatchPanel() { document.getElementById("watch-panel").classList.remove("open"); }
+  function toggleWatchPanel() {
+    document.getElementById("watch-panel").classList.contains("open") ? closeWatchPanel() : openWatchPanel();
+  }
+
+  document.addEventListener("click", (e) => {
+    const panel = document.getElementById("watch-panel");
+    const badge = document.getElementById("watch-badge");
+    if (panel && !panel.contains(e.target) && badge && !badge.contains(e.target)) closeWatchPanel();
+  });
+
+  function updateWatchBadge() {
+    let badge = document.getElementById("watch-badge");
+    if (watchedBays.size === 0) {
+      if (badge) badge.remove();
+      closeWatchPanel();
+      return;
+    }
+    if (!badge) {
+      badge = document.createElement("button");
+      badge.id = "watch-badge";
+      badge.addEventListener("click", (e) => { e.stopPropagation(); toggleWatchPanel(); });
+      document.getElementById("status-bar").prepend(badge);
+    }
+    badge.textContent = `Watching ${watchedBays.size} bay${watchedBays.size > 1 ? "s" : ""}`;
+  }
+
+  // ── Render ───────────────────────────────────────────────────────────────
+  function renderBays(bays) {
+    markers.forEach(m => m.remove());
+    markers = [];
+
+    bays.forEach(bay => {
+      const color  = bayColor(bay);
+      const marker = L.circleMarker([bay.lat, bay.lon], {
+        radius: 5,
+        color,
+        fillColor: color,
+        fillOpacity: 0.85,
+        weight: 1,
+      });
+
+      marker._bayStreet   = bay.street || "";
+      marker._bayOccupied = bay.occupied;
+      marker._bayId       = bay.id;
+      marker._bayData     = bay;
+
+      if (bay.occupied) {
+        marker.bindPopup(buildPopupContent(bay), { maxWidth: 220 });
+        wirePopupButton(marker, bay);
+      } else {
+        const updated = bay.updated_at
+          ? new Date(bay.updated_at).toLocaleTimeString("en-AU", { hour: "2-digit", minute: "2-digit" })
+          : "unknown";
+        const seg = bay.road_description ? `<br><span style="color:#94a3b8;font-size:0.76rem;">${bay.road_description}</span>` : "";
+        marker.bindTooltip(
+          `<b>Bay ${bay.id}</b>${seg}<br>Status: <b>${bay.status}</b><br>Last updated: ${updated}`,
+          { direction: "top", offset: [0, -4] }
+        );
+      }
+
+      marker.addTo(map);
+      markers.push(marker);
+    });
+  }
+
+  // ── Data loading ─────────────────────────────────────────────────────────
+  async function loadData(manual = false) {
+    if (manual) showLoading("Refreshing…");
+
+    try {
+      const res = await fetch("/api/parking");
+      if (!res.ok) throw new Error(`Server error ${res.status}`);
+      const data = await res.json();
+
+      renderBays(data.bays);
+
+      document.getElementById("count-free").textContent     = data.free;
+      document.getElementById("count-occupied").textContent = data.occupied;
+      document.getElementById("count-total").textContent    = data.total;
+
+      const fetchedAt = new Date(data.fetched_at).toLocaleTimeString("en-AU", {
+        hour: "2-digit", minute: "2-digit", second: "2-digit"
+      });
+      document.getElementById("last-updated").textContent = `Updated ${fetchedAt}`;
+
+      hideError();
+      // Re-apply street filter if one is active
+      if (activeStreet) applyStreetFilter();
+    } catch (err) {
+      showError(`Failed to load parking data: ${err.message}`);
+    } finally {
+      hideLoading();
+      scheduleRefresh();
+    }
+  }
+
+  function scheduleRefresh() {
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(() => loadData(false), 2 * 60 * 1000);  // 2 min
+  }
+
+  // ── UI helpers ───────────────────────────────────────────────────────────
+  function showLoading(msg = "Loading parking data…") {
+    const el = document.getElementById("loading-overlay");
+    el.querySelector("span").textContent = msg;
+    el.style.display = "flex";
+  }
+  function hideLoading() {
+    document.getElementById("loading-overlay").style.display = "none";
+  }
+  function showError(msg) {
+    const el = document.getElementById("error-banner");
+    el.textContent = msg;
+    el.style.display = "block";
+  }
+  function hideError() {
+    document.getElementById("error-banner").style.display = "none";
+  }
+
+  // ── Street filter ────────────────────────────────────────────────────────
+  let allStreets   = [];
+  let activeStreet = null;   // currently selected street name (or null = show all)
+
+  const streetInput   = document.getElementById("street-input");
+  const streetClear   = document.getElementById("street-clear");
+  const suggestionBox = document.getElementById("street-suggestions");
+  const streetResult  = document.getElementById("street-result");
+
+  async function loadStreets() {
+    try {
+      const res  = await fetch("/api/streets");
+      const data = await res.json();
+      allStreets = data.streets || [];
+    } catch (_) { /* non-critical */ }
+  }
+
+  function showSuggestions(query) {
+    suggestionBox.innerHTML = "";
+    if (!query) return;
+    const q = query.toLowerCase();
+    const matches = allStreets.filter(s => s.toLowerCase().includes(q)).slice(0, 8);
+    matches.forEach(s => {
+      const div = document.createElement("div");
+      div.className = "suggestion";
+      div.textContent = s;
+      div.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        selectStreet(s);
+      });
+      suggestionBox.appendChild(div);
+    });
+  }
+
+  function selectStreet(name) {
+    activeStreet = name;
+    streetInput.value = name;
+    streetClear.style.display = "block";
+    suggestionBox.innerHTML = "";
+    applyStreetFilter();
+  }
+
+  function clearStreet() {
+    activeStreet = null;
+    streetInput.value = "";
+    streetClear.style.display = "none";
+    suggestionBox.innerHTML = "";
+    streetResult.style.display = "none";
+    // Restore all markers to full opacity
+    markers.forEach(m => m.setStyle({ opacity: 1, fillOpacity: 0.85 }));
+  }
+
+  function applyStreetFilter() {
+    if (!activeStreet) return;
+    const name = activeStreet.toLowerCase();
+    let free = 0, occ = 0;
+
+    markers.forEach(m => {
+      const match = (m._bayStreet || "").toLowerCase() === name;
+      m.setStyle({
+        opacity:     match ? 1 : 0.08,
+        fillOpacity: match ? 0.9 : 0.05,
+      });
+      if (match) {
+        if (m._bayOccupied) occ++; else free++;
+      }
+    });
+
+    // Fit map to matching bays
+    const matchedLatLngs = markers
+      .filter(m => (m._bayStreet || "").toLowerCase() === name)
+      .map(m => m.getLatLng());
+    if (matchedLatLngs.length) map.fitBounds(L.latLngBounds(matchedLatLngs), { padding: [40, 40], maxZoom: 17 });
+
+    document.getElementById("result-name").textContent = activeStreet;
+    document.getElementById("result-free").textContent = free;
+    document.getElementById("result-occ").textContent  = occ;
+    streetResult.style.display = "block";
+  }
+
+  streetInput.addEventListener("input", () => {
+    const q = streetInput.value.trim();
+    streetClear.style.display = q ? "block" : "none";
+    if (activeStreet && streetInput.value !== activeStreet) {
+      activeStreet = null;
+      streetResult.style.display = "none";
+      markers.forEach(m => m.setStyle({ opacity: 1, fillOpacity: 0.85 }));
+    }
+    showSuggestions(q);
+  });
+
+  streetInput.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") clearStreet();
+  });
+
+  streetClear.addEventListener("click", clearStreet);
+
+  // ── Geolocation ──────────────────────────────────────────────────────────
+  let userMarker = null;
+
+  function locateUser() {
+    if (!navigator.geolocation) return;
+
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const { latitude: lat, longitude: lon, accuracy } = pos.coords;
+
+        // Place/update a pulsing marker at the user's position
+        if (userMarker) userMarker.remove();
+        userMarker = L.circleMarker([lat, lon], {
+          radius: 8,
+          color: "#ffffff",
+          fillColor: "#3b82f6",
+          fillOpacity: 0.9,
+          weight: 2,
+        }).addTo(map).bindTooltip("You are here", { permanent: false });
+
+        map.setView([lat, lon], 17);
+      },
+      () => {
+        // Permission denied or unavailable — stay on Villiers Street default
+        map.setView(DEFAULT_CENTER, DEFAULT_ZOOM);
+      },
+      { enableHighAccuracy: true, timeout: 8000 }
+    );
+  }
+
+  // ── Boot ─────────────────────────────────────────────────────────────────
+  async function init() {
+    try {
+      const res = await fetch("/api/pushover/status");
+      const data = await res.json();
+      pushoverEnabled = data.configured;
+    } catch (_) {}
+    locateUser();
+    loadStreets();
+    loadData();
+  }
+
+  init();
+</script>
+</body>
+</html>

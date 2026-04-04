@@ -1,0 +1,17 @@
+services:
+  parking:
+    build: .
+    container_name: melbourne-parking
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - DATA_DIR=/data
+    volumes:
+      # Persists parking.db and api_calls.log across container restarts/updates
+      - parking-data:/data
+
+volumes:
+  parking-data:
