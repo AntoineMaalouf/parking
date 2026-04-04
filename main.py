@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import logging.handlers
 import os
 import re
 from contextlib import asynccontextmanager
@@ -8,7 +7,6 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
-from cachetools import TTLCache
 from dotenv import load_dotenv
 
 import db
@@ -18,56 +16,17 @@ from pydantic import BaseModel
 
 load_dotenv()
 
-# ── Logging ───────────────────────────────────────────────────────────────────
-
 _data_dir = os.getenv("DATA_DIR", ".")
 os.makedirs(_data_dir, exist_ok=True)
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.handlers.RotatingFileHandler(
-            os.path.join(_data_dir, "api_calls.log"),
-            maxBytes=5 * 1024 * 1024,  # 5 MB
-            backupCount=3,
-            encoding="utf-8",
-        ),
-        logging.StreamHandler(),
-    ],
 )
 api_log = logging.getLogger("melbourne_api")
 
-
-def _log_call(method: str, url: str, status: int, elapsed_ms: float, records: int | None = None) -> None:
-    extra = f" — {records} records" if records is not None else ""
-    api_log.info("%s %s → %d (%.0f ms)%s", method, url, status, elapsed_ms, extra)
-
-
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    await db.init_db()
-
-    # Restore bay store from DB (avoids full API fetch on restart)
-    stored = await db.load_bay_store()
-    if stored:
-        global _last_sensor_fetch
-        _bay_store.update(stored)
-        _last_sensor_fetch = await db.get_state("last_sensor_fetch")
-        api_log.info("Restored %d bays from DB (last fetch: %s)", len(stored), _last_sensor_fetch)
-
-    # Restore watched bays from DB
-    watched = await db.load_watched_bays()
-    watched_bays.update(watched)
-    if watched:
-        api_log.info("Restored %d watched bays from DB", len(watched))
-
-    asyncio.create_task(_watch_loop())
-    yield
-
-
-app = FastAPI(title="Melbourne Parking Map", lifespan=lifespan)
+# ── App state ─────────────────────────────────────────────────────────────────
 
 SENSOR_API = (
     "https://data.melbourne.vic.gov.au/api/explore/v2.1/catalog/datasets"
@@ -84,18 +43,51 @@ BAYS_EXPORT_API = (
 PUSHOVER_API = "https://api.pushover.net/1/messages.json"
 PAGE_SIZE = 100
 
-# Static bay/street mapping: cache 24 hours
-street_cache: TTLCache = TTLCache(maxsize=1, ttl=86400)
 REQUEST_TIMEOUT = httpx.Timeout(connect=10, read=60, write=10, pool=5)
 
 # {bay_id: {"street": str, "road_description": str}} — bays being watched
 watched_bays: dict[int, dict] = {}
 
-# ── Sensor state (delta fetch) ────────────────────────────────────────────────
 # Full bay data store: {kerbsideid: raw_record_dict}
 _bay_store: dict[int, dict] = {}
 # ISO timestamp of last successful sensor fetch (used as delta filter)
 _last_sensor_fetch: str | None = None
+
+# Street map cache (no TTLCache — managed manually with _street_map_fetched_at)
+_street_map: dict[str, str] = {}
+_street_map_fetched_at: float = 0.0
+STREET_MAP_TTL = 86400  # 24 hours
+
+# Parking response cache
+_parking_cache: dict | None = None
+_parking_cache_at: float = 0.0
+PARKING_CACHE_TTL = 120  # 2 minutes
+
+# Lock preventing concurrent refreshes from doubling API calls (#3)
+_refresh_lock = asyncio.Lock()
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    global _last_sensor_fetch  # declared at function top, not nested in an if (#1)
+
+    await db.init_db()
+
+    # Restore bay store from DB (avoids full API fetch on restart)
+    stored = await db.load_bay_store()
+    if stored:
+        _bay_store.update(stored)
+        _last_sensor_fetch = await db.get_state("last_sensor_fetch")
+
+    # Restore watched bays from DB
+    watched = await db.load_watched_bays()
+    watched_bays.update(watched)
+
+    asyncio.create_task(_watch_loop())
+    yield
+
+
+app = FastAPI(title="Melbourne Parking Map", lifespan=lifespan)
 
 
 # ── Pushover ──────────────────────────────────────────────────────────────────
@@ -104,14 +96,23 @@ def pushover_configured() -> bool:
     return bool(os.getenv("PUSHOVER_API_TOKEN")) and bool(os.getenv("PUSHOVER_USER_KEY"))
 
 
-async def send_pushover(title: str, message: str) -> None:
+async def send_pushover(title: str, message: str) -> bool:
+    """Send a Pushover notification. Returns True on success. (#7)"""
     async with httpx.AsyncClient(timeout=10) as client:
-        await client.post(PUSHOVER_API, data={
+        response = await client.post(PUSHOVER_API, data={
             "token": os.getenv("PUSHOVER_API_TOKEN"),
             "user":  os.getenv("PUSHOVER_USER_KEY"),
             "title": title,
             "message": message,
         })
+    if response.status_code != 200:
+        api_log.error("Pushover HTTP error %d: %s", response.status_code, response.text)
+        return False
+    body = response.json()
+    if body.get("status") != 1:
+        api_log.error("Pushover delivery failed: %s", body)
+        return False
+    return True
 
 
 # ── Background watcher ────────────────────────────────────────────────────────
@@ -131,12 +132,17 @@ async def _watch_loop() -> None:
                     freed.append((bay_id, watched_bays.pop(bay_id)))
             for bay_id, info in freed:
                 street = info.get("road_description") or info.get("street") or f"Bay {bay_id}"
-                await send_pushover(
+                ok = await send_pushover(
                     "Parking spot free!",
                     f"Bay {bay_id} on {street} is now available.",
                 )
+                if ok:
+                    await db.delete_watched_bay(bay_id)
+                else:
+                    # Re-add to watch list if notification failed (#6)
+                    watched_bays[bay_id] = info
         except Exception:
-            pass
+            api_log.exception("Error in watch loop")  # log instead of silently swallow (#6)
 
 
 # ── Street helpers ────────────────────────────────────────────────────────────
@@ -149,41 +155,35 @@ def extract_street(description: str) -> str:
 # ── Data fetching ─────────────────────────────────────────────────────────────
 
 async def get_street_map() -> dict[str, str]:
-    if "map" in street_cache:
-        api_log.info("GET %s → cache hit", BAYS_EXPORT_API)
-        return street_cache["map"]
+    global _street_map, _street_map_fetched_at
 
-    t0 = asyncio.get_event_loop().time()
+    now = asyncio.get_running_loop().time()  # (#2)
+    if _street_map and (now - _street_map_fetched_at) < STREET_MAP_TTL:
+        return _street_map
+
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         response = await client.get(BAYS_EXPORT_API, params={"select": "kerbsideid,roadsegmentdescription"})
-    elapsed = (asyncio.get_event_loop().time() - t0) * 1000
-    _log_call("GET", BAYS_EXPORT_API, response.status_code, elapsed)
     if response.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Melbourne API error: {response.status_code}")
 
     records = response.json()
-    mapping = {
+    _street_map = {
         str(r["kerbsideid"]): r.get("roadsegmentdescription", "")
         for r in records if r.get("kerbsideid") is not None
     }
-    street_cache["map"] = mapping
-    return mapping
+    _street_map_fetched_at = now
+    return _street_map
 
 
 async def _full_sensor_fetch() -> None:
-    """Fetch all sensor records via the export endpoint (1 API call).
-    Populates _bay_store and sets _last_sensor_fetch."""
+    """Fetch all sensor records via the export endpoint (1 API call)."""
     global _last_sensor_fetch
 
-    t0 = asyncio.get_event_loop().time()
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         response = await client.get(
             SENSOR_EXPORT_API,
             params={"select": "kerbsideid,status_description,status_timestamp,location"},
         )
-    elapsed = (asyncio.get_event_loop().time() - t0) * 1000
-    _log_call("GET", SENSOR_EXPORT_API, response.status_code, elapsed, None)
-
     if response.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Melbourne API error: {response.status_code}")
 
@@ -194,18 +194,26 @@ async def _full_sensor_fetch() -> None:
             _bay_store[r["kerbsideid"]] = r
 
     _last_sensor_fetch = datetime.now(timezone.utc).isoformat()
-    await db.save_bay_records(list(_bay_store.values()))
-    await db.set_state("last_sensor_fetch", _last_sensor_fetch)
-    api_log.info("Full sensor fetch complete: %d bays stored", len(_bay_store))
+
+    try:
+        await db.save_bay_records(list(_bay_store.values()))
+        await db.set_state("last_sensor_fetch", _last_sensor_fetch)
+    except Exception:
+        api_log.exception("Failed to persist bay store to DB")
 
 
 async def _delta_sensor_fetch() -> None:
-    """Fetch only bays whose status changed since the last fetch (1–few API calls).
-    Merges updates into _bay_store and advances _last_sensor_fetch."""
+    """Fetch only bays whose status changed since the last fetch."""
     global _last_sensor_fetch
 
-    # Strip sub-second precision — ODS timestamp filter doesn't need it
-    since = _last_sensor_fetch[:19] + "+00:00"
+    # Guard against malformed timestamp in DB (#4)
+    raw = _last_sensor_fetch or ""
+    if len(raw) < 19:
+        api_log.warning("last_sensor_fetch '%s' is malformed — falling back to full fetch", raw)
+        await _full_sensor_fetch()
+        return
+
+    since = raw[:19] + "+00:00"
     fetch_started_at = datetime.now(timezone.utc).isoformat()
 
     offset = 0
@@ -214,7 +222,6 @@ async def _delta_sensor_fetch() -> None:
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         while True:
-            t0 = asyncio.get_event_loop().time()
             response = await client.get(
                 SENSOR_API,
                 params={
@@ -224,16 +231,12 @@ async def _delta_sensor_fetch() -> None:
                     "offset": offset,
                 },
             )
-            elapsed = (asyncio.get_event_loop().time() - t0) * 1000
-
             if response.status_code != 200:
-                _log_call("GET", SENSOR_API, response.status_code, elapsed)
                 raise HTTPException(status_code=502, detail=f"Melbourne API error: {response.status_code}")
 
-            data    = response.json()
-            page    = data.get("results", [])
-            total   = data.get("total_count", 0)
-            _log_call("GET", SENSOR_API, response.status_code, elapsed, len(page))
+            data  = response.json()
+            page  = data.get("results", [])
+            total = data.get("total_count", 0)
 
             for r in page:
                 if r.get("kerbsideid") is not None:
@@ -246,10 +249,14 @@ async def _delta_sensor_fetch() -> None:
                 break
 
     _last_sensor_fetch = fetch_started_at
-    if changed_records:
-        await db.save_bay_records(changed_records)
-    await db.set_state("last_sensor_fetch", _last_sensor_fetch)
-    api_log.info("Delta sensor fetch complete: %d bays updated (total store: %d)", total_updated, len(_bay_store))
+
+    # DB write failure must not prevent the response from succeeding (#8)
+    try:
+        if changed_records:
+            await db.save_bay_records(changed_records)
+        await db.set_state("last_sensor_fetch", _last_sensor_fetch)
+    except Exception:
+        api_log.exception("Failed to persist delta records to DB")
 
 
 async def _refresh_sensors() -> None:
@@ -281,38 +288,38 @@ def transform_record(record: dict, street_map: dict) -> Optional[dict]:
     }
 
 
-# Cache of the fully assembled /api/parking response (2 min TTL)
-_parking_cache: dict | None = None
-_parking_cache_at: float = 0.0
-PARKING_CACHE_TTL = 120  # seconds
-
-
 async def _get_parking_data() -> dict:
     global _parking_cache, _parking_cache_at
 
-    now = asyncio.get_event_loop().time()
+    now = asyncio.get_running_loop().time()  # (#2)
     if _parking_cache is not None and (now - _parking_cache_at) < PARKING_CACHE_TTL:
-        api_log.info("GET %s → cache hit", SENSOR_API)
         return _parking_cache
 
-    street_map = await get_street_map()
-    await _refresh_sensors()
+    # Lock prevents concurrent requests from both triggering a refresh (#3)
+    async with _refresh_lock:
+        # Re-check cache after acquiring lock (another request may have refreshed)
+        now = asyncio.get_running_loop().time()
+        if _parking_cache is not None and (now - _parking_cache_at) < PARKING_CACHE_TTL:
+            return _parking_cache
 
-    bays = [
-        t for r in _bay_store.values()
-        if (t := transform_record(r, street_map)) is not None
-    ]
-    occupied = sum(1 for b in bays if b["occupied"])
-    result = {
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
-        "total": len(bays),
-        "occupied": occupied,
-        "free": len(bays) - occupied,
-        "bays": bays,
-    }
-    _parking_cache = result
-    _parking_cache_at = now
-    return result
+        street_map = await get_street_map()
+        await _refresh_sensors()
+
+        bays = [
+            t for r in _bay_store.values()
+            if (t := transform_record(r, street_map)) is not None
+        ]
+        occupied = sum(1 for b in bays if b["occupied"])
+        result = {
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "total": len(bays),
+            "occupied": occupied,
+            "free": len(bays) - occupied,
+            "bays": bays,
+        }
+        _parking_cache = result
+        _parking_cache_at = asyncio.get_running_loop().time()
+        return result
 
 
 # ── API endpoints ─────────────────────────────────────────────────────────────
@@ -345,14 +352,20 @@ async def watch_bay(req: WatchRequest):
     if req.bay_id not in watched_bays and len(watched_bays) >= MAX_WATCHED:
         raise HTTPException(status_code=400, detail=f"Watch limit reached ({MAX_WATCHED} bays maximum).")
     watched_bays[req.bay_id] = {"street": req.street, "road_description": req.road_description}
-    await db.save_watched_bay(req.bay_id, req.street, req.road_description)
+    try:
+        await db.save_watched_bay(req.bay_id, req.street, req.road_description)
+    except Exception:
+        api_log.exception("Failed to persist watched bay %d to DB", req.bay_id)
     return {"watching": req.bay_id, "total_watched": len(watched_bays)}
 
 
 @app.delete("/api/watch/{bay_id}")
 async def unwatch_bay(bay_id: int):
     watched_bays.pop(bay_id, None)
-    await db.delete_watched_bay(bay_id)
+    try:
+        await db.delete_watched_bay(bay_id)
+    except Exception:
+        api_log.exception("Failed to delete watched bay %d from DB", bay_id)
     return {"unwatched": bay_id, "total_watched": len(watched_bays)}
 
 
@@ -364,6 +377,11 @@ async def get_watched():
 @app.get("/api/pushover/status")
 async def pushover_status():
     return {"configured": pushover_configured()}
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "bays_loaded": len(_bay_store), "watched": len(watched_bays)}
 
 
 app.mount("/", StaticFiles(directory="static", html=True), name="static")

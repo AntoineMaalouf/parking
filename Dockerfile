@@ -1,5 +1,5 @@
-# Multi-arch Python slim — works on Pi 4/5 (arm64) and Pi 3/Zero (arm/v7)
-FROM python:3.12-slim
+# Pin exact patch version for reproducible builds (#22)
+FROM python:3.12.10-slim
 
 # Keeps Python from buffering stdout/stderr (important for docker logs)
 ENV PYTHONUNBUFFERED=1 \
@@ -19,5 +19,9 @@ COPY static/ static/
 RUN mkdir -p /data
 
 EXPOSE 8000
+
+# Health check — Docker can restart the container if the app hangs (#20)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

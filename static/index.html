@@ -376,6 +376,16 @@
 </div>
 
 <script>
+  // ── HTML escape helper (prevents XSS from API values) (#12) ─────────────
+  function esc(str) {
+    return String(str ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
   // ── Map setup ────────────────────────────────────────────────────────────
   // Default centre: Villiers Street, North Melbourne
   const DEFAULT_CENTER = [-37.8013, 144.9523];
@@ -393,7 +403,8 @@
   }).addTo(map);
 
   // ── State ────────────────────────────────────────────────────────────────
-  let markers = [];           // array of L.circleMarker
+  let markers      = [];   // array of L.circleMarker
+  let segmentLines = [];   // array of L.polyline, one per road segment
   let refreshTimer = null;
   let pushoverEnabled = false;
   const MAX_WATCHED = 10;
@@ -460,19 +471,19 @@
     let notifyHtml = "";
     if (pushoverEnabled && bay.occupied) {
       notifyHtml = atLimit
-        ? `<div style="margin-top:7px;font-size:0.75rem;color:#94a3b8;">Watch limit reached (${MAX_WATCHED}/10)</div>`
+        ? `<div style="margin-top:7px;font-size:0.75rem;color:#94a3b8;">Watch limit reached (${MAX_WATCHED}/${MAX_WATCHED})</div>`
         : `<button class="notify-btn ${watching ? "unwatch" : "watch"}" id="notify-btn-${bay.id}">
              ${watching ? "Cancel notification" : "Notify me when free"}
            </button>`;
     }
     const segment = bay.road_description
-      ? `<div style="margin:3px 0 4px;color:#94a3b8;font-size:0.76rem;">${bay.road_description}</div>`
+      ? `<div style="margin:3px 0 4px;color:#94a3b8;font-size:0.76rem;">${esc(bay.road_description)}</div>`
       : "";
     return `<div class="popup-wrap">
-      <b>Bay ${bay.id}</b>
+      <b>Bay ${esc(bay.id)}</b>
       ${segment}
-      Status: <b>${bay.status}</b><br>
-      Last updated: ${updated}
+      Status: <b>${esc(bay.status)}</b><br>
+      Last updated: ${esc(updated)}
       ${notifyHtml}
     </div>`;
   }
@@ -504,8 +515,8 @@
       item.className = "watch-item";
       item.innerHTML = `
         <div class="watch-item-info">
-          <div class="watch-item-street">${info.road_description || info.street || "Unknown location"}</div>
-          <div class="watch-item-id">Bay ${bayId}</div>
+          <div class="watch-item-street">${esc(info.road_description || info.street || "Unknown location")}</div>
+          <div class="watch-item-id">Bay ${esc(bayId)}</div>
         </div>
         <button class="watch-remove" title="Remove">×</button>`;
       item.querySelector(".watch-remove").addEventListener("click", () => removeWatch(bayId));
@@ -555,43 +566,88 @@
     badge.textContent = `Watching ${watchedBays.size} bay${watchedBays.size > 1 ? "s" : ""}`;
   }
 
+  // ── Segment lines ────────────────────────────────────────────────────────
+  function renderSegmentLines(bays) {
+    segmentLines.forEach(l => l.remove());
+    segmentLines = [];
+
+    const groups = new Map();
+    bays.forEach(bay => {
+      if (!bay.road_description) return;
+      if (!groups.has(bay.road_description)) groups.set(bay.road_description, []);
+      groups.get(bay.road_description).push(bay);
+    });
+
+    groups.forEach(groupBays => {
+      if (groupBays.length < 2) return;
+      const latSpan = Math.max(...groupBays.map(b => b.lat)) - Math.min(...groupBays.map(b => b.lat));
+      const lonSpan = Math.max(...groupBays.map(b => b.lon)) - Math.min(...groupBays.map(b => b.lon));
+      const sorted  = [...groupBays].sort((a, b) => lonSpan >= latSpan ? a.lon - b.lon : a.lat - b.lat);
+      const line = L.polyline(sorted.map(b => [b.lat, b.lon]), {
+        color: "#3b82f6", weight: 6, opacity: 0.25,
+        lineCap: "round", lineJoin: "round", interactive: false,
+      });
+      line.addTo(map);
+      segmentLines.push(line);
+    });
+  }
+
+  // ── Marker factory ───────────────────────────────────────────────────────
+  function createMarker(bay) {
+    const color  = bayColor(bay);
+    const marker = L.circleMarker([bay.lat, bay.lon], {
+      radius: 5, color, fillColor: color, fillOpacity: 0.85, weight: 1,
+    });
+    marker._bayStreet   = bay.street || "";
+    marker._bayOccupied = bay.occupied;
+    marker._bayId       = bay.id;
+    marker._bayData     = bay;
+
+    if (bay.occupied) {
+      marker.bindPopup(buildPopupContent(bay), { maxWidth: 220 });
+      wirePopupButton(marker, bay);
+    } else {
+      const updated = bay.updated_at
+        ? new Date(bay.updated_at).toLocaleTimeString("en-AU", { hour: "2-digit", minute: "2-digit" })
+        : "unknown";
+      const seg = bay.road_description
+        ? `<br><span style="color:#94a3b8;font-size:0.76rem;">${esc(bay.road_description)}</span>` : "";
+      marker.bindTooltip(
+        `<b>Bay ${esc(bay.id)}</b>${seg}<br>Status: <b>${esc(bay.status)}</b><br>Last updated: ${esc(updated)}`,
+        { direction: "top", offset: [0, -4] }
+      );
+    }
+    return marker;
+  }
+
   // ── Render ───────────────────────────────────────────────────────────────
   function renderBays(bays) {
-    markers.forEach(m => m.remove());
-    markers = [];
+    // Draw segment lines first so they sit behind markers (#19)
+    try { renderSegmentLines(bays); } catch (err) { console.warn("Segment lines failed:", err.message); }
+
+    // Diff render — only replace markers whose status changed (#13)
+    const existingById = new Map(markers.map(m => [m._bayId, m]));
+    const newMarkers   = [];
 
     bays.forEach(bay => {
-      const color  = bayColor(bay);
-      const marker = L.circleMarker([bay.lat, bay.lon], {
-        radius: 5,
-        color,
-        fillColor: color,
-        fillOpacity: 0.85,
-        weight: 1,
-      });
-
-      marker._bayStreet   = bay.street || "";
-      marker._bayOccupied = bay.occupied;
-      marker._bayId       = bay.id;
-      marker._bayData     = bay;
-
-      if (bay.occupied) {
-        marker.bindPopup(buildPopupContent(bay), { maxWidth: 220 });
-        wirePopupButton(marker, bay);
+      const existing = existingById.get(bay.id);
+      if (existing && existing._bayOccupied === bay.occupied) {
+        // Status unchanged — keep the existing marker, just update data reference
+        existing._bayData = bay;
+        newMarkers.push(existing);
+        existingById.delete(bay.id);
       } else {
-        const updated = bay.updated_at
-          ? new Date(bay.updated_at).toLocaleTimeString("en-AU", { hour: "2-digit", minute: "2-digit" })
-          : "unknown";
-        const seg = bay.road_description ? `<br><span style="color:#94a3b8;font-size:0.76rem;">${bay.road_description}</span>` : "";
-        marker.bindTooltip(
-          `<b>Bay ${bay.id}</b>${seg}<br>Status: <b>${bay.status}</b><br>Last updated: ${updated}`,
-          { direction: "top", offset: [0, -4] }
-        );
+        // New or changed bay — remove old, create new
+        if (existing) { existing.remove(); existingById.delete(bay.id); }
+        const marker = createMarker(bay);
+        marker.addTo(map);
+        newMarkers.push(marker);
       }
-
-      marker.addTo(map);
-      markers.push(marker);
     });
+
+    // Remove any markers no longer in the dataset
+    existingById.forEach(m => m.remove());
+    markers = newMarkers;
   }
 
   // ── Data loading ─────────────────────────────────────────────────────────
@@ -660,9 +716,13 @@
   async function loadStreets() {
     try {
       const res  = await fetch("/api/streets");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       allStreets = data.streets || [];
-    } catch (_) { /* non-critical */ }
+    } catch (err) {
+      // Non-critical — street autocomplete won't work but map still loads (#18)
+      console.warn("Street list unavailable:", err.message);
+    }
   }
 
   function showSuggestions(query) {
@@ -704,6 +764,7 @@
     if (!activeStreet) return;
     const name = activeStreet.toLowerCase();
     let free = 0, occ = 0;
+    const matchedLatLngs = [];  // (#15) single pass — collect latlngs while styling
 
     markers.forEach(m => {
       const match = (m._bayStreet || "").toLowerCase() === name;
@@ -713,13 +774,10 @@
       });
       if (match) {
         if (m._bayOccupied) occ++; else free++;
+        matchedLatLngs.push(m.getLatLng());
       }
     });
 
-    // Fit map to matching bays
-    const matchedLatLngs = markers
-      .filter(m => (m._bayStreet || "").toLowerCase() === name)
-      .map(m => m.getLatLng());
     if (matchedLatLngs.length) map.fitBounds(L.latLngBounds(matchedLatLngs), { padding: [40, 40], maxZoom: 17 });
 
     document.getElementById("result-name").textContent = activeStreet;
@@ -753,7 +811,7 @@
 
     navigator.geolocation.getCurrentPosition(
       (pos) => {
-        const { latitude: lat, longitude: lon, accuracy } = pos.coords;
+        const { latitude: lat, longitude: lon } = pos.coords;
 
         // Place/update a pulsing marker at the user's position
         if (userMarker) userMarker.remove();

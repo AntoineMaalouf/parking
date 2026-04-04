@@ -4,7 +4,7 @@ services:
     container_name: melbourne-parking
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "0.0.0.0:8000:8000"  # Binds to all interfaces — accessible on LAN and Tailscale (#21)
     env_file:
       - .env
     environment:
