@@ -65,6 +65,7 @@ PARKING_CACHE_TTL = 120  # 2 minutes
 
 # Lock preventing concurrent refreshes from doubling API calls (#3)
 _refresh_lock = asyncio.Lock()
+_street_map_lock = asyncio.Lock()
 
 
 @asynccontextmanager
@@ -118,17 +119,18 @@ async def send_pushover(title: str, message: str) -> bool:
 # ── Background watcher ────────────────────────────────────────────────────────
 
 async def _watch_loop() -> None:
-    """Every 2 minutes, check if any watched bay has become free and notify.
-    Reuses the in-memory bay store rather than making extra API calls."""
+    """Every 2 minutes, refresh sensor data and notify for any watched bay that became free."""
     while True:
         await asyncio.sleep(120)
-        if not watched_bays or not _bay_store:
+        if not watched_bays:
             continue
         try:
+            async with _refresh_lock:
+                await _refresh_sensors()
             freed = []
             for bay_id in list(watched_bays.keys()):
                 record = _bay_store.get(bay_id)
-                if record and record.get("status_description") != "Present":
+                if record and record.get("status_description") == "Unoccupied":
                     freed.append((bay_id, watched_bays.pop(bay_id)))
             for bay_id, info in freed:
                 street = info.get("road_description") or info.get("street") or f"Bay {bay_id}"
@@ -161,18 +163,23 @@ async def get_street_map() -> dict[str, str]:
     if _street_map and (now - _street_map_fetched_at) < STREET_MAP_TTL:
         return _street_map
 
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        response = await client.get(BAYS_EXPORT_API, params={"select": "kerbsideid,roadsegmentdescription"})
-    if response.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Melbourne API error: {response.status_code}")
+    async with _street_map_lock:
+        now = asyncio.get_running_loop().time()
+        if _street_map and (now - _street_map_fetched_at) < STREET_MAP_TTL:
+            return _street_map
 
-    records = response.json()
-    _street_map = {
-        str(r["kerbsideid"]): r.get("roadsegmentdescription", "")
-        for r in records if r.get("kerbsideid") is not None
-    }
-    _street_map_fetched_at = now
-    return _street_map
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            response = await client.get(BAYS_EXPORT_API, params={"select": "kerbsideid,roadsegmentdescription"})
+        if response.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Melbourne API error: {response.status_code}")
+
+        records = response.json()
+        _street_map = {
+            str(r["kerbsideid"]): r.get("roadsegmentdescription", "")
+            for r in records if r.get("kerbsideid") is not None
+        }
+        _street_map_fetched_at = now
+        return _street_map
 
 
 async def _full_sensor_fetch() -> None:
@@ -188,6 +195,9 @@ async def _full_sensor_fetch() -> None:
         raise HTTPException(status_code=502, detail=f"Melbourne API error: {response.status_code}")
 
     records = response.json()
+    if not records:
+        api_log.warning("Full sensor fetch returned empty list — skipping bay store update")
+        return
     _bay_store.clear()
     for r in records:
         if r.get("kerbsideid") is not None:
@@ -217,7 +227,6 @@ async def _delta_sensor_fetch() -> None:
     fetch_started_at = datetime.now(timezone.utc).isoformat()
 
     offset = 0
-    total_updated = 0
     changed_records: list[dict] = []
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
@@ -242,7 +251,6 @@ async def _delta_sensor_fetch() -> None:
                 if r.get("kerbsideid") is not None:
                     _bay_store[r["kerbsideid"]] = r
                     changed_records.append(r)
-            total_updated += len(page)
 
             offset += PAGE_SIZE
             if offset >= total:
@@ -376,7 +384,7 @@ async def get_watched():
 
 @app.get("/api/pushover/status")
 async def pushover_status():
-    return {"configured": pushover_configured()}
+    return {"configured": pushover_configured(), "max_watched": MAX_WATCHED}
 
 
 @app.get("/health")

@@ -404,10 +404,9 @@
 
   // ── State ────────────────────────────────────────────────────────────────
   let markers      = [];   // array of L.circleMarker
-  let segmentLines = [];   // array of L.polyline, one per road segment
   let refreshTimer = null;
   let pushoverEnabled = false;
-  const MAX_WATCHED = 10;
+  let MAX_WATCHED = 10;
   const watchedBays = new Map();  // bay_id → {id, street, road_description}
 
   const FREE_COLOR     = "#22c55e";
@@ -566,32 +565,6 @@
     badge.textContent = `Watching ${watchedBays.size} bay${watchedBays.size > 1 ? "s" : ""}`;
   }
 
-  // ── Segment lines ────────────────────────────────────────────────────────
-  function renderSegmentLines(bays) {
-    segmentLines.forEach(l => l.remove());
-    segmentLines = [];
-
-    const groups = new Map();
-    bays.forEach(bay => {
-      if (!bay.road_description) return;
-      if (!groups.has(bay.road_description)) groups.set(bay.road_description, []);
-      groups.get(bay.road_description).push(bay);
-    });
-
-    groups.forEach(groupBays => {
-      if (groupBays.length < 2) return;
-      const latSpan = Math.max(...groupBays.map(b => b.lat)) - Math.min(...groupBays.map(b => b.lat));
-      const lonSpan = Math.max(...groupBays.map(b => b.lon)) - Math.min(...groupBays.map(b => b.lon));
-      const sorted  = [...groupBays].sort((a, b) => lonSpan >= latSpan ? a.lon - b.lon : a.lat - b.lat);
-      const line = L.polyline(sorted.map(b => [b.lat, b.lon]), {
-        color: "#3b82f6", weight: 6, opacity: 0.25,
-        lineCap: "round", lineJoin: "round", interactive: false,
-      });
-      line.addTo(map);
-      segmentLines.push(line);
-    });
-  }
-
   // ── Marker factory ───────────────────────────────────────────────────────
   function createMarker(bay) {
     const color  = bayColor(bay);
@@ -622,9 +595,6 @@
 
   // ── Render ───────────────────────────────────────────────────────────────
   function renderBays(bays) {
-    // Draw segment lines first so they sit behind markers (#19)
-    try { renderSegmentLines(bays); } catch (err) { console.warn("Segment lines failed:", err.message); }
-
     // Diff render — only replace markers whose status changed (#13)
     const existingById = new Map(markers.map(m => [m._bayId, m]));
     const newMarkers   = [];
@@ -839,6 +809,7 @@
       const res = await fetch("/api/pushover/status");
       const data = await res.json();
       pushoverEnabled = data.configured;
+      MAX_WATCHED = data.max_watched ?? MAX_WATCHED;
     } catch (_) {}
     locateUser();
     loadStreets();
